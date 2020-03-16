@@ -1,0 +1,13 @@
+---
+# handlers file for jitsi-meet
+- name: apache | check apache config
+  command: apache2ctl configtest
+  register: apache_config_check
+  listen: restart apache
+- name: apache | restart
+  service: 
+    name: apache2
+    state: restarted
+  when: apache_config_check.rc == 0
+  listen: restart apache
+

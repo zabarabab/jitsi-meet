@@ -1,0 +1,281 @@
+---
+# tasks file for jitsi-meet
+- name: system | install apt-transport-https
+  apt:
+    name: apt-transport-https # to access jitsi repository
+#wget -qO - https://download.jitsi.org/jitsi-key.gpg.key | sudo apt-key add -
+- name: system | Add Apt signing key for jitsi
+  apt_key:
+    #id: ???
+    url: https://download.jitsi.org/jitsi-key.gpg.key
+    state: present
+#echo 'deb https://download.jitsi.org testing/' > /etc/apt/sources.list.d/jitsi-testing.list
+- name: system | add backports repository for acme.sh
+  apt_repository:
+    repo: deb http://deb.debian.org/debian {{ansible_distribution_release}}-backports main
+- name: system | add repository for jitsi
+  apt_repository:
+    repo: deb https://download.jitsi.org stable/
+- name: system | configure apt to no-install-recommends
+  copy:
+    content: |
+      APT::Install-Recommends "0";
+      APT::Install-Suggests "0";
+    dest: /etc/apt/apt.conf.d/01no-install-recommends
+- name: system | install acme client dehydrated from backports
+  apt:
+    name:
+      - dehydrated
+      - dehydrated-apache2
+    default_release: "{{ansible_distribution_release}}-backports"
+- name: system | install packages
+  apt:
+    name:
+      - apache2
+      - acl
+      - ssl-cert
+      - debconf
+      - debconf-utils
+- name: acme | add user dehydrated
+  user:
+    name: dehydrated
+    group: ssl-cert
+    system: yes
+    shell: /bin/false
+    home: /var/lib/dehydrated
+    skeleton: false
+- name: Set default ACL for group ssl-cert on /var/lib/dehydrated
+  acl:
+    path: /var/lib/dehydrated
+    entity: ssl-cert
+    etype: group
+    permissions: r
+    default: yes
+    state: present
+- name: acme | add apache user www-data to group ssl-cert
+  user: 
+    name: www-data
+    groups: ssl-cert 
+    append: yes
+  register: add_apache_to_group_ssl_cert
+- name: acme | restart apache
+  service: 
+    name: apache2
+    state: restarted
+  when: add_apache_to_group_ssl_cert.changed
+- name: acme | check owner of dehydrated directories
+  file:
+    path: "{{item}}"
+    owner: dehydrated
+    group: ssl-cert
+    mode: 0750
+    state: directory
+  register: dehydrated_dir
+  loop: 
+    - /var/lib/dehydrated
+    - /var/lib/dehydrated/acme-challenges
+- name: acme | add user dehydrated to get certificates
+  command: dpkg-statoverride --update --add dehydrated ssl-cert 0750 {{item}}
+  when: dehydrated_dir.changed
+  loop: 
+    - /var/lib/dehydrated
+    - /var/lib/dehydrated/acme-challenges
+- name: acme | configure dehydrated
+  copy:
+    content: |
+      DEHYDRATED_USER=dehydrated
+      DEHYDRATED_GROUP=ssl-cert
+      CONTACT_EMAIL=info@linuxhotel.de
+      #CA="https://acme-staging-v02.api.letsencrypt.org/directory" # only for tests
+    dest: /etc/dehydrated/conf.d/meet.lab.linuxhotel.de.sh
+- name: acme | add domains to dehydrated
+  copy:
+    content: meet.lab.linuxhotel.de
+    dest: /etc/dehydrated/domains.txt
+- name: acme | add systemd-timer
+  copy:
+    content: |
+      [Unit]
+      Description=get certificates with dehydrated
+      
+      [Timer]
+      # get new certificates shortly before closing of training
+      OnCalendar=*-*-21 17:45
+      
+      [Install]
+      WantedBy=timers.target
+    dest: /etc/systemd/system/dehydrated.timer
+  register: dehydrated_timer
+- name: acme | check dehydrated.timer unit file
+  command: systemd-analyze verify dehydrated.timer
+  when: dehydrated_timer.changed
+- name: acme | add systemd-service
+  copy:
+    content: |
+      [Unit]
+      Description=get certificates with dehydrated
+      
+      [Service]
+      Type=oneshot
+      User=dehydrated
+      Group=ssl-cert
+      WorkingDirectory=/var/lib/dehydrated
+      ExecStart=/usr/bin/dehydrated -c
+      ExecStartPost=+/usr/sbin/service apache2 reload
+    dest: /etc/systemd/system/dehydrated.service
+  register: dehydrated_service
+- name: acme | check dehydrated.service unit file
+  command: systemd-analyze verify dehydrated.service
+  when: dehydrated_service.changed
+- name: acme | reload systemd
+  command: systemctl daemon-reload
+  when: dehydrated_service.changed or dehydrated_timer.changed
+- name: acme | activate timer
+  command: systemctl enable --now dehydrated.timer
+  when: dehydrated_service.changed or dehydrated_timer.changed
+- name: acme | create lets encrypt account
+  command: /usr/bin/dehydrated --register --accept-terms
+  args:
+    creates: /var/lib/dehydrated/accounts
+- name: acme | first time get certificates
+  command: systemctl start dehydrated.service
+  args:
+    creates: /var/lib/dehydrated/certs
+- name: apache | enable https
+  command: a2enmod ssl
+  args:
+    creates: /etc/apache2/mods-enabled/ssl.load
+  notify: restart apache
+- name: apache | remove default config
+  command: a2dissite 000-default
+  args:
+    removes: /etc/apache2/sites-enabled/000-default.conf
+  notify: restart apache
+- name: apache | add config for meet.lab.linuxhotel.de
+  copy:
+    content: |
+      # to suppress the servername warning
+      ServerName meet.lab.linuxhotel.de
+
+      <VirtualHost *:80>
+              ServerName meet.lab.linuxhotel.de
+              ServerAdmin info@linuxhotel.de
+              DocumentRoot /var/www/html
+              ErrorLog ${APACHE_LOG_DIR}/error.log
+              CustomLog ${APACHE_LOG_DIR}/access.log combined
+              Redirect permanent / https://meet.lab.linuxhotel.de/
+              RewriteEngine On
+              RewriteCond %{HTTPS} off
+              RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+      </VirtualHost>
+      
+      <VirtualHost _default_:443>
+              ServerName meet.lab.linuxhotel.de
+              SSLEngine on
+              SSLProtocol +TLSv1.2 +TLSv1.3
+              SSLCipherSuite 'EDH+CAMELLIA:EDH+aRSA:EECDH+aRSA+AESGCM:EECDH+aRSA+SHA256:EECDH:+CAMELLIA128:+AES128:+SSLv3:!aNULL:!eNULL:!LOW:!3DES:!MD5:!EXP:!PSK:!DSS:!RC4:!SEED:!IDEA:!ECDSA:kEDH:!CAMELLIA128-SHA:!AES128-SHA'
+              #SSLCertificateFile      /var/lib/dehydrated/certs/meet.lab.linuxhotel.de/cert.pem
+              SSLCertificateFile      /var/lib/dehydrated/certs/meet.lab.linuxhotel.de/fullchain.pem
+              SSLCertificateKeyFile   /var/lib/dehydrated/certs/meet.lab.linuxhotel.de/privkey.pem
+              <FilesMatch "\.(cgi|shtml|phtml|php)$">
+                              SSLOptions +StdEnvVars
+              </FilesMatch>
+              <Directory /usr/lib/cgi-bin>
+                              SSLOptions +StdEnvVars
+              </Directory>
+              
+              # Rest heavily inspired by /usr/share/doc/jitsi-meet-web-config/jitsi-meet.example-apache
+              DocumentRoot "/usr/share/jitsi-meet"
+              <Directory "/usr/share/jitsi-meet">
+                Options Indexes MultiViews Includes FollowSymLinks
+                AddOutputFilter Includes html
+                AllowOverride All
+                #Order allow,deny
+                #Allow from all
+                Require all granted
+              </Directory>
+              
+              ErrorDocument 404 /static/404.html
+              
+              Alias "/config.js" "/etc/jitsi/meet/meet.lab.linuxhotel.de-config.js"
+              <Location /config.js>
+                Require all granted
+              </Location>
+              
+              Alias "/external_api.js" "/usr/share/jitsi-meet/libs/external_api.min.js"
+              <Location /external_api.js>
+                Require all granted
+              </Location>
+              
+              # should that go into a Location, too?
+              ProxyPreserveHost on
+              ProxyPass /http-bind http://localhost:5280/http-bind/
+              ProxyPassReverse /http-bind http://localhost:5280/http-bind/
+              #RemoteIPHeader X-Forwarded-For # needs mod_remoteip
+              
+              RewriteEngine on
+              RewriteRule ^/([a-zA-Z0-9]+)$ /index.html
+      </VirtualHost>
+    dest: /etc/apache2/sites-available/meet.lab.linuxhotel.de.conf
+  notify: restart apache
+- name: apache | enable config for meet.lab.linuxhotel.de
+  command: a2ensite meet.lab.linuxhotel.de
+  args:
+    creates: /etc/apache2/sites-enabled/meet.lab.linuxhotel.de.conf
+  notify: restart apache
+- name: Jitsi Videobridge Component secret
+  debconf:
+    name: jitsi-videobridge
+    question: jitsi-videobridge/jvbsecret
+    # TODO: move that to variable or generate it
+    value: Maereew4
+    vtype: password
+- name: jitsi | The hostname of the current installation
+  debconf:
+    name: jitsi-videobridge
+    question: jitsi-videobridge/jvb-hostname
+    value: meet.lab.linuxhotel.de
+    vtype: string
+- name: jitsi | The hostname of the current installation
+  debconf:
+    name: jitsi-meet-web-config
+    question: jitsi-meet/jvb-hostname
+    value: meet.lab.linuxhotel.de
+    vtype: string
+- name: jitsi | Full local server path to the SSL certificate file
+  debconf:
+    name: jitsi-meet-web-config
+    question: jitsi-meet/cert-path-crt
+    value: /var/lib/dehydrated/certs/meet.lab.linuxhotel.de/fullchain.pem
+    vtype: string
+- name: jitsi | Full local server path to the SSL key file
+  debconf:
+    name: jitsi-meet-web-config
+    question: jitsi-meet/cert-path-key
+    value: /var/lib/dehydrated/certs/meet.lab.linuxhotel.de/privkey.pem
+    vtype: string
+#- name: jitsi | we better don't touch this as long as we don't unterstand it ...
+#  debconf:
+#    name: jitsi-meet-web-config
+#    question: jitsi-meet/jvb-serve
+#    value: false
+#    vtype: boolean
+- name: jitsi | choose to use my own certificate
+  debconf:
+    name: jitsi-meet-web-config
+    question: jitsi-meet/cert-choice
+    value: I want to use my own certificate
+    vtype: select
+- name: jitsi | choose to restart jitsi-videobridge.service
+  debconf:
+    name: unknown
+    question: needrestart/ui-query_pkgs
+    value: jitsi-videobridge.service
+    vtype: multiselect
+#- name: jitsi | install packages
+#  apt:
+#    name:
+#      - jitsi-meet
+#      - lua-event
+# DNS:meet.lab.linuxhotel.de, DNS:conference.meet.lab.linuxhotel.de, DNS:focus.meet.lab.linuxhotel.de, DNS:auth.meet.lab.linuxhotel.de, DNS:jitsi-videobridge.meet.lab.linuxhotel.de
+
